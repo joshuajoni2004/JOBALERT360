@@ -1,117 +1,268 @@
+```python
 """
-formatter.py — Uses Google Gemini (FREE) instead of Claude.
-Free tier: 1,500 requests/day. Your bot uses ~96/day. Plenty.
-Get key at: https://aistudio.google.com → Get API Key
+formatter.py — Advanced Gemini formatter for Jobs Alert 360
+Stable version with:
+- Gemini 2.0 Flash support
+- Retry handling
+- Fallback formatting
+- Better parsing
+- Safe response extraction
+- Cleaner Telegram output
 """
+
 import os
-import requests
+import re
+import time
 import logging
+import requests
 
 logger = logging.getLogger(__name__)
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+MODEL = "gemini-2.0-flash"
+
 GEMINI_URL = (
-    "https://generativelanguage.googleapis.com/v1beta/models/"
-    "gemini-1.5-flash:generateContent?key={key}"
+    f"https://generativelanguage.googleapis.com/v1beta/models/"
+    f"{MODEL}:generateContent?key={GEMINI_API_KEY}"
 )
 
 
-def _call_gemini(prompt: str, max_tokens: int = 600) -> str | None:
+# =========================================================
+# GEMINI CALL
+# =========================================================
+
+def _call_gemini(prompt: str, max_tokens: int = 700, retries: int = 3) -> str | None:
+    """
+    Safe Gemini request with retries and fallback handling.
+    """
+
     if not GEMINI_API_KEY:
-        logger.error("GEMINI_API_KEY not set in .env")
+        logger.error("GEMINI_API_KEY missing")
         return None
 
-    url = GEMINI_URL.format(key=GEMINI_API_KEY)
-    body = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "maxOutputTokens": max_tokens,
-            "temperature": 0.2,
-        },
+    headers = {
+        "Content-Type": "application/json"
     }
-    try:
-        resp = requests.post(url, json=body, timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
-        return data["candidates"][0]["content"]["parts"][0]["text"].strip()
-    except Exception as e:
-        logger.error(f"Gemini API call failed: {e}")
-        return None
+
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": prompt}
+                ]
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.3,
+            "maxOutputTokens": max_tokens,
+            "topP": 0.9,
+            "topK": 40
+        }
+    }
+
+    for attempt in range(retries):
+        try:
+            response = requests.post(
+                GEMINI_URL,
+                headers=headers,
+                json=payload,
+                timeout=30
+            )
+
+            response.raise_for_status()
+
+            data = response.json()
+
+            if "candidates" not in data:
+                logger.error(f"No candidates in Gemini response: {data}")
+                return None
+
+            text = (
+                data["candidates"][0]
+                ["content"]["parts"][0]["text"]
+                .strip()
+            )
+
+            return text
+
+        except requests.exceptions.Timeout:
+            logger.warning(f"Gemini timeout (attempt {attempt+1})")
+
+        except requests.exceptions.HTTPError as e:
+            logger.error(f"Gemini HTTP error: {e}")
+
+        except Exception as e:
+            logger.error(f"Gemini unknown error: {e}")
+
+        time.sleep(2)
+
+    return None
 
 
-def format_job(job: dict) -> dict | None:
-    prompt = f"""You are a job listing formatter for Indian freshers (2024-2026 batch).
+# =========================================================
+# CLEANUP
+# =========================================================
 
-Given raw job data, format it into EXACTLY this template. Use "Not specified" for missing fields.
-Return ONLY the formatted message. No explanation, no extra text.
+def _clean_text(text: str) -> str:
+    text = re.sub(r'\*\*', '', text)
+    text = re.sub(r'#+', '', text)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
 
-📢 COMPANY: [company name]
 
-💼 ROLE: [job title]
+# =========================================================
+# FALLBACK FORMATTER
+# =========================================================
+
+def _fallback_format(job: dict) -> str:
+
+    title = job.get("title", "Unknown Role")
+    company = job.get("company", "Unknown Company")
+    location = job.get("location", "India")
+    link = job.get("link", "#")
+
+    return f"""
+🚀 FRESHER JOB ALERT
+
+🏢 COMPANY: {company}
+
+💼 ROLE: {title}
+
+📍 LOCATION: {location}
 
 🎓 ELIGIBILITY:
-• Degree: [degree required]
-• Batch: [batch year e.g. 2024/2025/2026]
-• [any other key criteria on separate bullet]
+• Freshers Eligible
+• 2024 / 2025 / 2026 Batch
 
-📍 LOCATION: [location]
+💰 PACKAGE: Not specified
 
-💰 PACKAGE: [salary/stipend or "Not specified"]
-
-📅 LAST DATE: [deadline or "Apply ASAP"]
+📅 LAST DATE:
+Apply ASAP
 
 🔗 APPLY HERE:
-[apply link]
+{link}
 
-⚡ React fast — fresher roles close quickly!
-📤 Share with friends who need a job 🚀
+⚡ Join @AsyncHireJobs for daily verified jobs
+📤 Share with friends 🚀
+""".strip()
 
----
+
+# =========================================================
+# MAIN FORMATTER
+# =========================================================
+
+def format_job(job: dict) -> dict | None:
+
+    prompt = f"""
+You are an expert Telegram job formatter for Indian freshers.
+
+Create a HIGH-QUALITY Telegram post.
+
+STRICT RULES:
+- Output ONLY the formatted post
+- No markdown code blocks
+- No explanations
+- Keep under 1200 characters
+- Use emojis professionally
+- Make it highly readable
+- Mention fresher eligibility
+- Mention if remote/hybrid if available
+
+FORMAT STYLE:
+
+🚀 FRESHER JOB ALERT
+
+🏢 COMPANY: ...
+
+💼 ROLE: ...
+
+📍 LOCATION: ...
+
+🎓 ELIGIBILITY:
+• ...
+• ...
+
+💰 PACKAGE: ...
+
+📅 LAST DATE: ...
+
+🔗 APPLY HERE:
+...
+
+⚡ React fast — applications close quickly!
+
 RAW JOB DATA:
-Title: {job.get('title', 'Not provided')}
-Company: {job.get('company', 'Not provided')}
-Location: {job.get('location', 'Not provided')}
-Summary: {job.get('summary', 'Not provided')[:400]}
-Source: {job.get('source', 'Not provided')}
-Link: {job.get('link', 'Not provided')}"""
 
-    text = _call_gemini(prompt, max_tokens=600)
+Title: {job.get('title', '')}
+Company: {job.get('company', '')}
+Location: {job.get('location', '')}
+Summary: {job.get('summary', '')[:800]}
+Source: {job.get('source', '')}
+Link: {job.get('link', '')}
+"""
+
+    text = _call_gemini(prompt)
+
     if not text:
-        return None
+        logger.warning("Gemini failed → using fallback formatter")
+        text = _fallback_format(job)
 
-    company  = _extract_field(text, "COMPANY:")
-    role     = _extract_field(text, "ROLE:")
+    text = _clean_text(text)
+
+    company = _extract_field(text, "COMPANY:")
+    role = _extract_field(text, "ROLE:")
     location = _extract_field(text, "LOCATION:")
-    batch    = _extract_field(text, "Batch:")
 
     return {
         "telegram_msg": text,
-        "company":  company  or job.get("company", ""),
-        "role":     role     or job.get("title", ""),
+        "company": company or job.get("company", ""),
+        "role": role or job.get("title", ""),
         "location": location or job.get("location", ""),
-        "batch":    batch    or "",
+        "batch": "2024/2025/2026",
     }
 
 
+# =========================================================
+# VERIFY JOB
+# =========================================================
+
 def verify_job_is_real(job: dict) -> bool:
-    prompt = f"""Is this a real, legitimate job for freshers in India (not spam, not fake, not senior-only)?
-Title: {job.get('title', '')}
-Company: {job.get('company', '')}
-Summary: {job.get('summary', '')[:200]}
-Link: {job.get('link', '')}
 
-Reply with ONLY the word YES or NO."""
+    title = job.get("title", "").lower()
+    summary = job.get("summary", "").lower()
 
-    answer = _call_gemini(prompt, max_tokens=5)
-    if answer is None:
-        return True
-    return answer.strip().upper().startswith("Y")
+    bad_keywords = [
+        "senior",
+        "5 years",
+        "7 years",
+        "director",
+        "manager",
+        "lead engineer",
+        "principal engineer"
+    ]
 
+    for word in bad_keywords:
+        if word in title or word in summary:
+            return False
+
+    return True
+
+
+# =========================================================
+# FIELD EXTRACTOR
+# =========================================================
 
 def _extract_field(text: str, label: str) -> str:
+
     for line in text.splitlines():
+
         if label.lower() in line.lower():
+
             parts = line.split(":", 1)
+
             if len(parts) == 2:
                 return parts[1].strip()
+
     return ""
+```
