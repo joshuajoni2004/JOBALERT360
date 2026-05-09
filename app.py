@@ -101,7 +101,7 @@ if __name__ == "__main__":
     app_url = os.getenv("RAILWAY_STATIC_URL") or os.getenv("APP_URL", "")
     if app_url:
         threading.Thread(
-            target=lambda: set_webhook(f"https://{app_url}"), daemon=True
+            target=lambda: set_webhook(app_url), daemon=True
         ).start()
     else:
         logger.warning("APP_URL not set — webhook not registered. Bot won't respond to commands.")
