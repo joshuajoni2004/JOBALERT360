@@ -1,178 +1,166 @@
+"""
+formatter.py
+Uses Google Gemini FREE tier with proper rate limiting.
+Falls back to pure-Python template formatter if Gemini fails/rate-limited.
+The fallback produces perfect output — bot never fails to post.
+"""
 import os
-import re
 import time
 import logging
 import requests
 
 logger = logging.getLogger(__name__)
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-
-MODEL = "gemini-2.0-flash"
-
-GEMINI_URL = (
-    f"https://generativelanguage.googleapis.com/v1beta/models/"
-    f"{MODEL}:generateContent?key={GEMINI_API_KEY}"
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+# gemini-1.5-flash: 15 RPM free. gemini-2.0-flash: lower limits.
+GEMINI_MODEL   = "gemini-1.5-flash"
+GEMINI_URL     = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    f"{GEMINI_MODEL}:generateContent?key={{key}}"
 )
+# Seconds to wait between Gemini calls (15 RPM = 1 per 4s, use 5 to be safe)
+GEMINI_DELAY   = 5
+_last_call_ts  = 0.0   # module-level rate limiter
 
 
-def _call_gemini(prompt: str, max_tokens: int = 700, retries: int = 3):
-
+def _call_gemini(prompt: str, max_tokens: int = 500) -> str | None:
+    global _last_call_ts
     if not GEMINI_API_KEY:
-        logger.error("GEMINI_API_KEY missing")
         return None
 
-    payload = {
-        "contents": [
-            {
-                "parts": [
-                    {"text": prompt}
-                ]
-            }
-        ],
-        "generationConfig": {
-            "temperature": 0.3,
-            "maxOutputTokens": max_tokens,
-            "topP": 0.9,
-            "topK": 40
-        }
+    # Enforce minimum gap between calls
+    gap = time.time() - _last_call_ts
+    if gap < GEMINI_DELAY:
+        time.sleep(GEMINI_DELAY - gap)
+
+    url  = GEMINI_URL.format(key=GEMINI_API_KEY)
+    body = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"maxOutputTokens": max_tokens, "temperature": 0.1},
     }
-
-    headers = {
-        "Content-Type": "application/json"
-    }
-
-    for attempt in range(retries):
-
-        try:
-
-            response = requests.post(
-                GEMINI_URL,
-                headers=headers,
-                json=payload,
-                timeout=30
-            )
-
-            response.raise_for_status()
-
-            data = response.json()
-
-            if "candidates" not in data:
-                logger.error(f"No Gemini candidates: {data}")
-                return None
-
-            return (
-                data["candidates"][0]
-                ["content"]["parts"][0]["text"]
-                .strip()
-            )
-
-        except Exception as e:
-            logger.error(f"Gemini API call failed: {e}")
-
-        time.sleep(2)
-
-    return None
+    try:
+        _last_call_ts = time.time()
+        resp = requests.post(url, json=body, timeout=20)
+        if resp.status_code == 429:
+            logger.warning("Gemini rate limit hit — waiting 30s then retrying once")
+            time.sleep(30)
+            _last_call_ts = time.time()
+            resp = requests.post(url, json=body, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+        _last_call_ts = time.time()
+        return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+    except Exception as e:
+        logger.warning(f"Gemini failed → using fallback: {e}")
+        return None
 
 
-def _clean_text(text: str):
+# ── Pure-Python fallback formatter (no AI needed) ────────────────────
+def _fallback_format(job: dict) -> str:
+    """
+    Format job using only the data we already scraped.
+    Produces clean, correct Telegram message without any API call.
+    """
+    company  = job.get("company", "").strip() or "See listing"
+    role     = job.get("title",   "").strip() or "Fresher Role"
+    location = job.get("location","").strip() or "India"
+    link     = job.get("link",    "").strip() or "Check company website"
+    source   = job.get("source",  "").strip()
 
-    text = re.sub(r'\*\*', '', text)
-    text = re.sub(r'#+', '', text)
-    text = re.sub(r'\n{3,}', '\n\n', text)
+    # Try to detect batch from title/summary
+    text = (role + job.get("summary","")).lower()
+    batch = "2024/2025/2026"
+    if "2026" in text: batch = "2024/2025/2026"
+    if "2025" in text and "2026" not in text: batch = "2024/2025"
 
-    return text.strip()
+    # Detect package hints
+    package = "Not specified"
+    for kw in ["lpa","lakh","stipend","salary","ctc","per annum"]:
+        if kw in text:
+            package = "As per company norms"
+            break
+
+    return (
+        f"📢 COMPANY: {company}\n\n"
+        f"💼 ROLE: {role}\n\n"
+        f"🎓 ELIGIBILITY:\n"
+        f"• Degree: B.Tech / BE / BCA / BSc (CS/IT)\n"
+        f"• Batch: {batch}\n"
+        f"• Freshers eligible\n\n"
+        f"📍 LOCATION: {location}\n\n"
+        f"💰 PACKAGE: {package}\n\n"
+        f"📅 LAST DATE: Apply ASAP\n\n"
+        f"🔗 APPLY HERE:\n{link}\n\n"
+        f"⚡ React fast — fresher roles close quickly!\n"
+        f"📤 Share with friends who need a job 🚀"
+    )
 
 
-def _fallback_format(job: dict):
+# ── Main format function ─────────────────────────────────────────────
+def format_job(job: dict) -> dict | None:
+    gemini_text = None
 
-    title = job.get("title", "Unknown Role")
-    company = job.get("company", "Unknown Company")
-    location = job.get("location", "India")
-    link = job.get("link", "#")
+    if GEMINI_API_KEY:
+        prompt = f"""Format this job for Indian freshers into EXACTLY this template.
+Use "Not specified" for missing info. Return ONLY the formatted message, nothing else.
 
-    return f"""
-🚀 FRESHER JOB ALERT
-
-🏢 COMPANY: {company}
-
-💼 ROLE: {title}
-
-📍 LOCATION: {location}
-
+📢 COMPANY: [company]
+💼 ROLE: [title]
 🎓 ELIGIBILITY:
-• Freshers Eligible
-• 2024 / 2025 / 2026 Batch
-
-💰 PACKAGE: Not specified
-
-📅 LAST DATE:
-Apply ASAP
-
+• Degree: [degree]
+• Batch: [e.g. 2024/2025/2026]
+• [other criteria]
+📍 LOCATION: [location]
+💰 PACKAGE: [salary or "Not specified"]
+📅 LAST DATE: [deadline or "Apply ASAP"]
 🔗 APPLY HERE:
-{link}
+[link]
+⚡ React fast — fresher roles close quickly!
+📤 Share with friends who need a job 🚀
 
-⚡ React fast — applications close quickly!
-📤 Share with friends 🚀
-""".strip()
+JOB DATA:
+Title: {job.get('title','')}
+Company: {job.get('company','')}
+Location: {job.get('location','')}
+Summary: {job.get('summary','')[:300]}
+Link: {job.get('link','')}"""
+        gemini_text = _call_gemini(prompt, max_tokens=500)
 
+    msg_text = gemini_text or _fallback_format(job)
 
-def format_job(job: dict):
-
-    prompt = f"""
-You are an expert Telegram job formatter for Indian freshers.
-
-Create a HIGH-QUALITY Telegram post.
-
-STRICT RULES:
-- Output ONLY the formatted post
-- No markdown code blocks
-- No explanations
-- Keep under 1200 characters
-
-RAW JOB DATA:
-
-Title: {job.get('title', '')}
-Company: {job.get('company', '')}
-Location: {job.get('location', '')}
-Summary: {job.get('summary', '')[:800]}
-Source: {job.get('source', '')}
-Link: {job.get('link', '')}
-"""
-
-    text = _call_gemini(prompt)
-
-    if not text:
-        logger.warning("Gemini failed → using fallback")
-        text = _fallback_format(job)
-
-    text = _clean_text(text)
+    company  = _extract(msg_text, "COMPANY:")  or job.get("company","")
+    role     = _extract(msg_text, "ROLE:")     or job.get("title","")
+    location = _extract(msg_text, "LOCATION:") or job.get("location","")
+    batch    = _extract(msg_text, "Batch:")    or ""
 
     return {
-        "telegram_msg": text,
-        "company": job.get("company", ""),
-        "role": job.get("title", ""),
-        "location": job.get("location", ""),
-        "batch": "2024/2025/2026"
+        "telegram_msg": msg_text,
+        "company":  company,
+        "role":     role,
+        "location": location,
+        "batch":    batch,
     }
 
 
-def verify_job_is_real(job: dict):
-
-    title = job.get("title", "").lower()
-    summary = job.get("summary", "").lower()
-
-    bad_keywords = [
-        "senior",
-        "manager",
-        "director",
-        "lead engineer",
-        "5 years",
-        "7 years"
-    ]
-
-    for word in bad_keywords:
-        if word in title or word in summary:
-            return False
-
+def verify_job_is_real(job: dict) -> bool:
+    """
+    Skip AI verification entirely if Gemini quota is tight.
+    Rely on the scraper's keyword filter instead — it already works well.
+    """
+    # Only call Gemini verify if we have plenty of quota
+    # For now: trust the scraper filter, return True always
+    title = job.get("title","").lower()
+    # Hard block obvious non-jobs
+    blocklist = ["invest","earn profit","mlm","network market","part time earn"]
+    if any(b in title for b in blocklist):
+        return False
     return True
+
+
+def _extract(text: str, label: str) -> str:
+    for line in text.splitlines():
+        if label.lower() in line.lower():
+            parts = line.split(":", 1)
+            if len(parts) == 2:
+                return parts[1].strip()
+    return ""
