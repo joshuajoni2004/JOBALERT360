@@ -220,3 +220,75 @@ def fetch_all_jobs() -> list:
 
     logger.info(f"Total unique jobs: {len(unique)}")
     return unique
+
+
+# ════════════════════════════════════════════════════════════════════
+# DATA ANALYST CHANNEL — dedicated scraper
+# ════════════════════════════════════════════════════════════════════
+
+DA_KEYWORDS = [
+    'data analyst', 'business analyst', 'analyst intern', 'sql analyst',
+    'bi analyst', 'data intern', 'junior analyst', 'data associate',
+    'analytics analyst', 'power bi analyst', 'tableau analyst',
+    'reporting analyst', 'mis analyst', 'insights analyst',
+    'junior data', 'analyst trainee',
+]
+
+def is_da_job(title: str, summary: str = "") -> bool:
+    """Must be DA-related AND fresher-level."""
+    return any(kw in title.lower() for kw in DA_KEYWORDS) and is_fresher(title, summary)
+
+
+def fetch_da_jobs() -> list:
+    jobs, queries = [], [
+        "data analyst fresher India",
+        "junior data analyst India 2025",
+        "data analyst intern India 2026",
+        "business analyst fresher India",
+        "SQL data analyst fresher India",
+        "Power BI analyst fresher India",
+        "Tableau analyst fresher India",
+        "MIS analyst fresher India",
+        "analytics associate fresher India",
+        "reporting analyst fresher India",
+        "data analyst trainee India 2026",
+        "Excel data analyst fresher India",
+        "entry level data analyst India",
+        "data analyst associate India 2025",
+    ]
+    for q in queries:
+        url = (
+            "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search"
+            f"?keywords={__import__('requests').utils.quote(q)}&location=India&start=0&f_E=1,2"
+        )
+        r = safe_get(url, 18)
+        if not r: continue
+        soup = BeautifulSoup(r.text, "html.parser")
+        for card in soup.find_all("li")[:6]:
+            t  = card.find("h3")
+            c  = card.find("h4")
+            lo = card.find("span", class_=re.compile(r"location"))
+            lk = card.find("a", href=True)
+            if not t: continue
+            title = t.get_text(strip=True)
+            if not is_da_job(title): continue
+            link = lk["href"].split("?")[0] if lk else ""
+            jobs.append({"title": title,
+                         "company": c.get_text(strip=True) if c else "",
+                         "location": lo.get_text(strip=True) if lo else "India",
+                         "link": link, "summary": "", "source": "LinkedIn"})
+        time.sleep(2)
+    logger.info(f"DA LinkedIn → {len(jobs)}")
+    return jobs
+
+
+def fetch_all_da_jobs() -> list:
+    raw  = fetch_da_jobs()
+    seen, unique = set(), []
+    for job in raw:
+        key = job.get("link","").strip() or f"{job['title']}{job.get('company','')}"
+        if key and key not in seen:
+            seen.add(key)
+            unique.append(job)
+    logger.info(f"DA total unique: {len(unique)}")
+    return unique
